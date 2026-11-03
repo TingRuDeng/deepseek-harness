@@ -1,8 +1,10 @@
 /**
- * The model-facing `read_image` tool commits a PNG/JPEG/WebP/GIF file. A path
- * without a file extension is identified from its file signature, while the
- * attachment service's full decode stays authoritative. The mounted `ctx.fs`
- * backend owns path resolution and read access; names only declare media type.
+ * The model-facing `read_image` tool commits a PNG/JPEG/WebP/GIF file. A
+ * supported file signature selects the media type and the attachment
+ * service's full decode stays authoritative, so a legacy JPEG stored under a
+ * `.png` name is read as a JPEG and keeps its original name. The mounted
+ * `ctx.fs` backend owns path resolution and read access; the extension only
+ * admits the path.
  *
  * The route gate is deliberately stricter than the host upload preflight. An
  * image-reading tool is useful only when the exact calling route can inspect
@@ -21,7 +23,7 @@ import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
 import { resolveRegularReadTarget } from './read-target.ts'
 
-/** Extensions `read_image` accepts; magic-byte validation at the attachment service stays authoritative. */
+/** Extensions whose paths `read_image` admits; a supported signature selects the stored media type. */
 const IMAGE_EXTENSIONS: Readonly<Record<string, ImageMediaType>> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -241,9 +243,9 @@ export function applyReadImageTool(ctx: Context): void {
       if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
 
       // Every pre-read gate runs before any filesystem I/O so a refusal never
-      // leaks partial reads or attachment writes. An extension-less path
-      // declares no format, so only its format and deployment media-type
-      // checks wait for the bytes.
+      // leaks partial reads or attachment writes. An unsupported extension is
+      // refused here; every admitted path waits for its bytes to select the
+      // media type.
       const extension = extname(args.file_path).toLowerCase()
       const declared = imageMediaTypeForPath(args.file_path)
       if (declared === undefined && extension !== '') {
@@ -253,7 +255,6 @@ export function applyReadImageTool(ctx: Context): void {
       if (attachments === undefined) {
         throw new Error(`cannot read "${args.file_path}" as an image: no attachment service is mounted`)
       }
-      if (declared !== undefined) assertDeploymentAccepts(attachments, declared, args.file_path)
       await assertImageCapableRoute(ctx, exec, args.file_path)
 
       const { target, info } = await resolveRegularReadTarget(ctx, exec, args.file_path)
@@ -262,11 +263,15 @@ export function applyReadImageTool(ctx: Context): void {
       // aggregate bound applies beside the per-image bound.
       const byteCap = Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes)
       const data = await ctx.fs.readBytes(target, exec.signal, byteCap)
-      const mediaType = declared ?? sniffImageMediaType(data)
+      // The extension only admits the path. Historical workspaces can carry a
+      // JPEG under a `.png` name, so the bytes select the media type and the
+      // attachment store validates the decoded image. This keeps the deployment
+      // policy tied to the bytes that will actually be persisted.
+      const mediaType = sniffImageMediaType(data)
       if (mediaType === undefined) {
         throw new Error(`cannot read "${target.displayPath}": the file content is not a supported image format; read_image accepts PNG/JPEG/WebP/GIF`)
       }
-      if (declared === undefined) assertDeploymentAccepts(attachments, mediaType, target.displayPath)
+      assertDeploymentAccepts(attachments, mediaType, target.displayPath)
       // Persist before returning: the image block must reference a durably
       // committed object by the time the tool/result event is appended.
       let ref: ImageAttachmentRef
@@ -301,21 +306,15 @@ export function applyReadImageTool(ctx: Context): void {
             { cause: error },
           )
         }
-        if (error.code === 'INVALID_IMAGE' && declared === undefined) {
+        if (error.code === 'INVALID_IMAGE') {
           throw new Error(
             `cannot read "${target.displayPath}": the bytes do not decode as a supported PNG/JPEG/WebP/GIF image; the file may be truncated or corrupt`,
             { cause: error },
           )
         }
         if (error.code !== 'IMAGE_TYPE_MISMATCH') throw error
-        if (declared === undefined) {
-          throw new Error(
-            `cannot read "${target.displayPath}": the file signature claims ${mediaType}, but the bytes decode as a different image format; the file may be corrupt`,
-            { cause: error },
-          )
-        }
         throw new Error(
-          `cannot read "${target.displayPath}": the ${extension} extension declares ${mediaType}, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`,
+          `cannot read "${target.displayPath}": the file signature claims ${mediaType}, but the bytes decode as a different image format; the file may be corrupt`,
           { cause: error },
         )
       }

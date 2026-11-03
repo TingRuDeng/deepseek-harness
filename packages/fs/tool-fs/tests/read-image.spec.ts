@@ -39,6 +39,8 @@ const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADEl
 const PNG_3X3 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAIAAADZSiLoAAAAEElEQVR4nGP4z8AAQQxYWACPjgj4kWPEuQAAAABJRU5ErkJggg==', 'base64')
 /** 1x1 red GIF (GIF89a). */
 const GIF_1X1 = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64')
+/** 1x1 JPEG used to model legacy files whose extension was preserved as `.png`. */
+const JPEG_1X1 = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/AYf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/AYf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Aqf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QH//EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z', 'base64')
 
 const testToolSignal = new AbortController().signal
 
@@ -558,6 +560,7 @@ describe('argument and service preconditions', () => {
         throw new Error('unreachable in this test')
       }
     }
+    await writeFile(join(dir, 'red.png'), PNG_1X1)
     const ctx = await setup({ attachments: false })
     await ctx.plugin(JpegOnlyStore)
     const result = await readImage(ctx, { file_path: 'red.png' }, agentOn('vision-model'))
@@ -567,13 +570,32 @@ describe('argument and service preconditions', () => {
 })
 
 describe('image admission failures', () => {
-  it('explains how to repair a declared/actual media-type mismatch', async () => {
-    await writeFile(join(dir, 'wrong.jpg'), PNG_1X1)
+  it('uses the detected media type when a legacy extension disagrees with the bytes', async () => {
+    await writeFile(join(dir, 'legacy.png'), JPEG_1X1)
     const ctx = await setup()
-    const result = await readImage(ctx, { file_path: 'wrong.jpg' }, agentOn('vision-model'))
+    const result = await readImage(ctx, { file_path: 'legacy.png' }, agentOn('vision-model'))
+    expect(result.isError).toBe(false)
+    const image = result.content.find(block => block.type === 'image')
+    expect(image?.attachment.mediaType).toBe('image/jpeg')
+    expect(image?.attachment.name).toBe('legacy.png')
+    expect(text(result)).toContain('image/jpeg image, 1x1 px')
+    expect(text(result)).toContain(`<path>${await realpath(join(dir, 'legacy.png'))}</path>`)
+  })
+
+  it('refuses bytes without a supported signature even under an image extension', async () => {
+    await writeFile(join(dir, 'notes.png'), 'plain text, not an image')
+    const ctx = await setup()
+    const result = await readImage(ctx, { file_path: 'notes.png' }, agentOn('vision-model'))
     expect(result.isError).toBe(true)
-    expect(text(result)).toContain('the .jpg extension declares image/jpeg')
-    expect(text(result)).toContain('rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats')
+    expect(text(result)).toContain(`cannot read "${join(dir, 'notes.png')}": the file content is not a supported image format`)
+  })
+
+  it('reports a signed image whose bytes do not decode', async () => {
+    await writeFile(join(dir, 'broken.png'), PNG_1X1.subarray(0, 16))
+    const ctx = await setup()
+    const result = await readImage(ctx, { file_path: 'broken.png' }, agentOn('vision-model'))
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('do not decode as a supported PNG/JPEG/WebP/GIF image')
   })
 
   it('caps an extension-less read at maxImageBytes before format detection', async () => {
